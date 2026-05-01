@@ -44,7 +44,7 @@ venv\Scripts\activate     # Windows
 Установка зависимостей:
 
 ```bash
-pip install -r requirements_2gis.txt
+pip install -r requirements.txt
 ```
 
 Установка браузера Playwright:
