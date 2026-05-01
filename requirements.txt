@@ -1,0 +1,12 @@
+# 2GIS Parser Requirements
+
+# Основные зависимости
+playwright>=1.40.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+
+# Для асинхронности (обычно уже в Python 3.10+)
+asyncio>=3.4.3
+
+# Опционально для логирования
+colorlog>=6.7.0
