@@ -254,8 +254,8 @@ class ParallelParser:
         async with async_playwright() as playwright:
             browser = None
             try:
-                # Получаем прокси для этого worker'а
-                proxy = self.proxy_manager.get_proxy()
+                # Получаем прокси для этого worker'а с привязкой по worker_id
+                proxy = self.proxy_manager.get_proxy(worker_id=worker_id)
                 if proxy:
                     logger.info(f"[Worker {worker_id}] Используется прокси: {proxy['server']}")
                 
@@ -403,14 +403,66 @@ class ParallelParser:
         return False
     
     async def _is_captcha_page(self, page) -> bool:
-        """Проверяет наличие капчи на странице."""
+        """
+        Проверяет наличие Яндекс SmartCaptcha на странице.
+        
+        Ищет:
+        - Селектор .smart-captcha
+        - iframe с captcha-api.yandex.ru
+        - Контейнеры с ID captcha-container
+        - Русский текст капчи: "Подтвердите, что вы не робот", "Введите символы", "Подозрительная активность"
+        
+        Returns:
+            True если обнаружена капча, False если нет
+        """
         try:
-            if await page.query_selector("iframe[src*='recaptcha'], div.g-recaptcha, [class*='captcha']"):
+            # Проверка 1: Селектор Яндекс SmartCaptcha
+            if await page.query_selector(".smart-captcha"):
+                logger.debug("Обнаружена капча: селектор .smart-captcha")
                 return True
             
-            body_text = (await page.inner_text("body")).lower()
-            return "captcha" in body_text or "g-recaptcha" in body_text
-        except Exception:
+            # Проверка 2: iframe с Яндекс Captcha API
+            if await page.query_selector("iframe[src*='captcha-api.yandex.ru']"):
+                logger.debug("Обнаружена капча: iframe с captcha-api.yandex.ru")
+                return True
+            
+            # Проверка 3: Контейнер капчи по ID
+            if await page.query_selector("#captcha-container"):
+                logger.debug("Обнаружена капча: #captcha-container")
+                return True
+            
+            # Проверка 4: Общий селектор для любых капч (fallback)
+            if await page.query_selector("[class*='captcha'], [id*='captcha']"):
+                logger.debug("Обнаружена капча: общий селектор [class*='captcha']")
+                return True
+            
+            # Проверка 5: Русский текст капчи в body
+            try:
+                body_text = await page.inner_text("body")
+                if body_text:
+                    body_lower = body_text.lower()
+                    
+                    # Яндекс SmartCaptcha фразы
+                    captcha_phrases = [
+                        "подтвердите, что вы не робот",
+                        "подтвердите что вы не робот",
+                        "введите символы",
+                        "подозрительная активность",
+                        "проверка безопасности",
+                        "captcha",
+                    ]
+                    
+                    for phrase in captcha_phrases:
+                        if phrase in body_lower:
+                            logger.debug(f"Обнаружена капча: текст '{phrase}'")
+                            return True
+            except Exception as text_error:
+                logger.debug(f"Ошибка при проверке текста body: {text_error}")
+            
+            return False
+            
+        except Exception as e:
+            logger.debug(f"Ошибка при проверке капчи: {e}")
             return False
     
     async def _extract_company_data(self, page, firm_url: str) -> Optional[Dict[str, Any]]:

@@ -25,12 +25,16 @@ PROXY_CONFIG = {
 BROWSER_CONFIG = {
     "headless": False,  # False для отладки, True для production
     "viewport": {"width": 1920, "height": 1080},
-    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "args": [
         "--disable-blink-features=AutomationControlled",
         "--disable-dev-shm-usage",
         "--no-sandbox",
         "--disable-gpu",
+        "--disable-features=IsolateOrigins,site-per-process",
+        "--disable-site-isolation-trials",
+        "--disable-web-security",
+        "--disable-features=VizDisplayCompositor",
     ],
 }
 

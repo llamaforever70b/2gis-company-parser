@@ -248,13 +248,23 @@ class GisParser:
         self.logger.info("Парсер инициализирован")
         self.logger.info(f"URL категории: {category_url}")
 
-    async def init_browser(self):
-        """Инициализация браузера с Playwright Stealth и контекстными менеджерами."""
+    async def init_browser(self, force_new_proxy: bool = False):
+        """
+        Инициализация браузера с Playwright Stealth и контекстными менеджерами.
+        
+        Args:
+            force_new_proxy: Принудительно получить новый прокси (для ротации)
+        """
         try:
             # Используем контекстный менеджер для автоматической очистки
-            self.playwright = await async_playwright().start()
+            if not self.playwright:
+                self.playwright = await async_playwright().start()
 
             # Получаем прокси через умный менеджер
+            if force_new_proxy:
+                # При принудительной ротации сбрасываем текущий прокси
+                self.proxy_manager.current_proxy = None
+            
             proxy = self.proxy_manager.get_proxy()
             if proxy:
                 self.logger.info(f"Используется прокси: {proxy['server']}")
@@ -285,18 +295,46 @@ class GisParser:
                 # Добавляем JavaScript для скрытия признаков автоматизации
                 await self.context.add_init_script(
                     """
+                    // Скрываем webdriver
                     Object.defineProperty(navigator, 'webdriver', {
                         get: () => undefined
                     });
+                    
+                    // Добавляем плагины
                     Object.defineProperty(navigator, 'plugins', {
                         get: () => [1, 2, 3, 4, 5]
                     });
+                    
+                    // Языки
                     Object.defineProperty(navigator, 'languages', {
                         get: () => ['ru-RU', 'ru', 'en-US', 'en']
                     });
+                    
+                    // Chrome runtime
                     window.chrome = {
                         runtime: {}
                     };
+                    
+                    // Permissions
+                    const originalQuery = window.navigator.permissions.query;
+                    window.navigator.permissions.query = (parameters) => (
+                        parameters.name === 'notifications' ?
+                            Promise.resolve({ state: Notification.permission }) :
+                            originalQuery(parameters)
+                    );
+                    
+                    // User-Agent Data (для Chrome 90+)
+                    Object.defineProperty(navigator, 'userAgentData', {
+                        get: () => ({
+                            brands: [
+                                { brand: "Google Chrome", version: "131" },
+                                { brand: "Chromium", version: "131" },
+                                { brand: "Not_A Brand", version: "24" }
+                            ],
+                            mobile: false,
+                            platform: "Windows"
+                        })
+                    });
                     """
                 )
                 self.logger.info("Встроенные методы обхода автоматизации активированы")
@@ -312,20 +350,113 @@ class GisParser:
             self._closing = True
             raise
 
+    async def reinit_browser_with_new_proxy(self, reason: str = "manual"):
+        """
+        Полностью пересоздает браузер и контекст с новым прокси.
+        Необходимо для ротации прокси, так как в Playwright прокси нельзя сменить на лету.
+        
+        Args:
+            reason: Причина переключения прокси
+        """
+        self.logger.info(f"🔄 Пересоздание браузера с новым прокси. Причина: {reason}")
+        
+        try:
+            # Закрываем текущий контекст
+            if self.context:
+                try:
+                    await self.context.close()
+                    self.logger.debug("Контекст закрыт")
+                except Exception as e:
+                    self.logger.debug(f"Ошибка при закрытии контекста: {e}")
+                self.context = None
+            
+            # Закрываем текущий браузер
+            if self.browser:
+                try:
+                    await self.browser.close()
+                    self.logger.debug("Браузер закрыт")
+                except Exception as e:
+                    self.logger.debug(f"Ошибка при закрытии браузера: {e}")
+                self.browser = None
+            
+            # Переключаем прокси в менеджере
+            self.proxy_manager.switch_proxy(reason)
+            
+            # Инициализируем браузер заново с новым прокси
+            await self.init_browser(force_new_proxy=True)
+            
+            self.logger.info("✓ Браузер успешно пересоздан с новым прокси")
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка при пересоздании браузера: {e}")
+            raise
+
     async def random_delay(self, min_delay: float, max_delay: float):
         """Случайная задержка для имитации человека."""
         delay = random.uniform(min_delay, max_delay)
         await asyncio.sleep(delay)
 
     async def is_captcha_page(self, page: Page) -> bool:
-        """Проверяет, есть ли признаки капчи на странице."""
+        """
+        Проверяет, есть ли признаки Яндекс SmartCaptcha на странице.
+        
+        Ищет:
+        - Селектор .smart-captcha
+        - iframe с captcha-api.yandex.ru
+        - Контейнеры с ID captcha-container
+        - Русский текст капчи: "Подтвердите, что вы не робот", "Введите символы", "Подозрительная активность"
+        
+        Returns:
+            True если обнаружена капча, False если нет
+        """
         try:
-            if await page.query_selector("iframe[src*='recaptcha'], div.g-recaptcha, [class*='captcha']"):
+            # Проверка 1: Селектор Яндекс SmartCaptcha
+            if await page.query_selector(".smart-captcha"):
+                self.logger.debug("Обнаружена капча: селектор .smart-captcha")
                 return True
-
-            body_text = (await page.inner_text("body")).lower()
-            return "captcha" in body_text or "g-recaptcha" in body_text
-        except Exception:
+            
+            # Проверка 2: iframe с Яндекс Captcha API
+            if await page.query_selector("iframe[src*='captcha-api.yandex.ru']"):
+                self.logger.debug("Обнаружена капча: iframe с captcha-api.yandex.ru")
+                return True
+            
+            # Проверка 3: Контейнер капчи по ID
+            if await page.query_selector("#captcha-container"):
+                self.logger.debug("Обнаружена капча: #captcha-container")
+                return True
+            
+            # Проверка 4: Общий селектор для любых капч (fallback)
+            if await page.query_selector("[class*='captcha'], [id*='captcha']"):
+                self.logger.debug("Обнаружена капча: общий селектор [class*='captcha']")
+                return True
+            
+            # Проверка 5: Русский текст капчи в body
+            try:
+                body_text = await page.inner_text("body")
+                if body_text:
+                    body_lower = body_text.lower()
+                    
+                    # Яндекс SmartCaptcha фразы
+                    captcha_phrases = [
+                        "подтвердите, что вы не робот",
+                        "подтвердите что вы не робот",
+                        "введите символы",
+                        "подозрительная активность",
+                        "проверка безопасности",
+                        "captcha",
+                    ]
+                    
+                    for phrase in captcha_phrases:
+                        if phrase in body_lower:
+                            self.logger.debug(f"Обнаружена капча: текст '{phrase}'")
+                            return True
+            except Exception as text_error:
+                self.logger.debug(f"Ошибка при проверке текста body: {text_error}")
+            
+            return False
+            
+        except Exception as e:
+            self.logger.debug(f"Ошибка при проверке капчи: {e}")
             return False
 
     async def goto_with_retry_on_http_error(self, page: Page, url: str, wait_until: str = "commit", timeout: int = 60000):
@@ -346,9 +477,31 @@ class GisParser:
                     continue
                 raise Exception(f"HTTP {status} после повторной попытки: {url}")
 
+            # Проверяем и обходим предупреждение о старом браузере
+            await self.bypass_browser_warning(page)
+            
             return response
 
         return None
+
+    async def bypass_browser_warning(self, page: Page):
+        """
+        Обходит предупреждение 2ГИС о старом браузере.
+        Если на странице есть кнопка 'Пропустить обновление браузера', кликает на неё.
+        """
+        try:
+            # Проверяем наличие предупреждения
+            warning_button = await page.query_selector('#acceptRiskButton')
+            if warning_button:
+                self.logger.info("⚠️  Обнаружено предупреждение о браузере, обходим...")
+                await warning_button.click()
+                # Ждем загрузки реальной страницы
+                await page.wait_for_load_state("domcontentloaded", timeout=30000)
+                await asyncio.sleep(2)  # Дополнительная пауза для загрузки контента
+                self.logger.info("✓ Предупреждение о браузере обойдено")
+        except Exception as e:
+            # Если кнопки нет - это нормально, значит предупреждения не было
+            self.logger.debug(f"Предупреждение о браузере не найдено (это нормально): {e}")
 
     def build_page_url(self, base_url: str, page_num: int) -> str:
         """Строит URL страницы поиска в формате /page/{N}."""
@@ -450,57 +603,6 @@ class GisParser:
         
         # Возвращаем 0 (без ограничений) и флаг адаптивной пагинации
         return 0, True  # Использовать адаптивную пагинацию без ограничений
-
-    def _get_next_page_url(self, base_url: str, page_number: int) -> str:
-        """
-        Формирует URL следующей страницы для прямой пагинации.
-        
-        Args:
-            base_url: Базовый URL категории
-            page_number: Номер страницы (начиная с 1)
-            
-        Returns:
-            URL страницы в формате .../page/{page_number}
-        """
-        # Удаляем существующий /page/N из URL если есть
-        clean_url = re.sub(r'/page/\d+/?$', '', base_url.rstrip('/'))
-        
-        # Для первой страницы возвращаем базовый URL без /page/1
-        if page_number == 1:
-            return clean_url
-        
-        # Для остальных страниц добавляем /page/N
-        return f"{clean_url}/page/{page_number}"
-
-    async def _check_page_has_results(self, page: Page) -> bool:
-        """
-        Проверяет, есть ли на странице карточки компаний.
-        
-        Returns:
-            True если найдены карточки, False если страница пустая
-        """
-        try:
-            # Ждём появления карточек (максимум 10 секунд)
-            await page.wait_for_selector(
-                SELECTORS["company_card"],
-                timeout=10000,
-                state="visible"
-            )
-            
-            # Проверяем количество карточек
-            cards = await page.query_selector_all(SELECTORS["company_card"])
-            cards_count = len(cards)
-            
-            if cards_count > 0:
-                self.logger.debug(f"✓ На странице найдено {cards_count} карточек")
-                return True
-            else:
-                self.logger.debug("✗ Карточки не найдены на странице")
-                return False
-                
-        except Exception as e:
-            self.logger.debug(f"✗ Ошибка при проверке наличия карточек: {e}")
-            return False
 
     def _get_next_page_url(self, base_url: str, page_number: int) -> str:
         """
@@ -1203,7 +1305,17 @@ class GisParser:
                         # Определяем тип ошибки для статистики прокси
                         if "429" in error_msg or "403" in error_msg:
                             self.proxy_manager.mark_failure("429" if "429" in error_msg else "403")
-                            self.proxy_manager.switch_proxy("HTTP блокировка")
+                            await detail_page.close()
+                            
+                            # Пересоздаем браузер с новым прокси
+                            try:
+                                await self.reinit_browser_with_new_proxy("HTTP блокировка")
+                                # Создаем новую страницу после пересоздания браузера
+                                page = await self.context.new_page()
+                            except Exception as reinit_error:
+                                self.logger.error(f"Не удалось пересоздать браузер: {reinit_error}")
+                            
+                            continue
                         elif "timeout" in error_msg or "connection" in error_msg:
                             self.proxy_manager.mark_failure("connection")
                         else:
@@ -1217,9 +1329,15 @@ class GisParser:
                         self.proxy_manager.mark_failure("captcha")
                         await detail_page.close()
                         
-                        # Пытаемся переключить прокси и продолжить
-                        self.proxy_manager.switch_proxy("captcha")
-                        self.logger.info("Попытка продолжить с другим прокси...")
+                        # Пересоздаем браузер с новым прокси
+                        try:
+                            await self.reinit_browser_with_new_proxy("captcha")
+                            # Создаем новую страницу после пересоздания браузера
+                            page = await self.context.new_page()
+                            self.logger.info("✓ Браузер пересоздан, продолжаем с новым прокси")
+                        except Exception as reinit_error:
+                            self.logger.error(f"Не удалось пересоздать браузер: {reinit_error}")
+                        
                         continue
                     
                     # Ждем появления заголовка h1 (название фирмы)

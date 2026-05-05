@@ -180,10 +180,13 @@ class ProxyManager:
         else:
             logger.info(f"✓ ProxyManager инициализирован с {len(self.proxy_list)} прокси")
     
-    def get_proxy(self) -> Optional[Dict[str, str]]:
+    def get_proxy(self, worker_id: Optional[int] = None) -> Optional[Dict[str, str]]:
         """
         Возвращает доступный прокси в формате для Playwright.
         Автоматически пропускает забаненные прокси.
+        
+        Args:
+            worker_id: ID воркера (для распределения прокси между воркерами)
         
         Returns:
             Словарь с параметрами прокси для Playwright или None
@@ -213,19 +216,28 @@ class ProxyManager:
                     logger.info(f"⏳ Ожидание разблокировки прокси: {wait_seconds:.0f} сек")
                     time.sleep(min(wait_seconds, 60))
                     # Рекурсивно пробуем снова после ожидания
-                    return self.get_proxy()
+                    return self.get_proxy(worker_id)
             
             return None
         
-        # Выбираем прокси с наилучшей статистикой
-        # Приоритет: меньше всего последовательных ошибок, выше success_rate
-        best_proxy = min(
-            available,
-            key=lambda p: (
-                self.stats[p].consecutive_failures,
-                -self.stats[p].success_rate
+        # Если указан worker_id и есть достаточно прокси, привязываем воркер к прокси
+        if worker_id is not None and len(available) > 1:
+            # Используем worker_id для детерминированного выбора прокси
+            # Это гарантирует, что разные воркеры получат разные прокси при старте
+            proxy_index = (worker_id - 1) % len(available)
+            best_proxy = available[proxy_index]
+            logger.info(f"[Worker {worker_id}] Привязан к прокси #{proxy_index + 1}")
+        else:
+            # Если worker_id не указан или прокси мало, выбираем по статистике
+            # Добавляем случайность для избежания коллизий при одинаковой статистике
+            best_proxy = min(
+                available,
+                key=lambda p: (
+                    self.stats[p].consecutive_failures,
+                    -self.stats[p].success_rate,
+                    random.random()  # Случайный фактор для разрешения коллизий
+                )
             )
-        )
         
         self.current_proxy = best_proxy
         self.stats[best_proxy].last_used = datetime.now()
